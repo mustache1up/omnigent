@@ -1449,6 +1449,59 @@ class SqlAlchemyConversationStore(ConversationStore):
 
         return persisted
 
+    def list_collections(
+        self,
+        accessible_by: str | None = None,
+    ) -> list[str]:
+        """
+        Return all distinct collection names, ordered alphabetically.
+
+        Collections are implicit: they exist as long as at least one
+        ``conversation_labels`` row with ``key="collection"`` references
+        them.
+
+        :param accessible_by: When set, restrict to sessions that
+            ``accessible_by`` has a permission row for (mirrors the
+            ``list_conversations`` ACL filter).
+        :returns: List of collection names ordered ascending.
+        """
+        with self._session() as session:
+            stmt = (
+                select(SqlConversationLabel.value)
+                .where(SqlConversationLabel.key == "collection")
+                .distinct()
+                .order_by(SqlConversationLabel.value)
+            )
+            if accessible_by is not None:
+                from omnigent.db.db_models import SqlSessionPermission
+
+                accessible_ids = select(SqlSessionPermission.conversation_id).where(
+                    SqlSessionPermission.user_id == accessible_by
+                )
+                stmt = stmt.where(SqlConversationLabel.conversation_id.in_(accessible_ids))
+            return [row[0] for row in session.execute(stmt).all()]
+
+    def delete_label(
+        self,
+        conversation_id: str,
+        key: str,
+    ) -> None:
+        """
+        Delete a single label key from a conversation.
+
+        No-op if the label does not exist.
+
+        :param conversation_id: The conversation to update.
+        :param key: The label key to remove, e.g. ``"collection"``.
+        """
+        with self._session() as session:
+            session.execute(
+                delete(SqlConversationLabel).where(
+                    SqlConversationLabel.conversation_id == conversation_id,
+                    SqlConversationLabel.key == key,
+                )
+            )
+
     def list_conversations(
         self,
         limit: int = 20,
@@ -1465,6 +1518,7 @@ class SqlAlchemyConversationStore(ConversationStore):
         search_query: str | None = None,
         accessible_by: str | None = None,
         include_archived: bool = False,
+        collection: str | None = None,
     ) -> PagedList[Conversation]:
         """
         List conversations with cursor-based pagination.
@@ -1509,6 +1563,12 @@ class SqlAlchemyConversationStore(ConversationStore):
         :param include_archived: When ``False`` (default), exclude
             rows where ``archived`` is true. When ``True``, include
             archived rows alongside non-archived ones.
+        :param collection: When set to a non-empty string, only return
+            sessions that have a ``conversation_labels`` row with
+            ``key="collection"`` and ``value=collection``. When set to an
+            empty string ``""``, only return sessions with NO collection
+            label (i.e., unfiled sessions). ``None`` disables the
+            filter.
         :returns: A :class:`PagedList` of :class:`Conversation`
             objects.
         """
@@ -1558,6 +1618,26 @@ class SqlAlchemyConversationStore(ConversationStore):
                     .distinct()
                 )
                 stmt = stmt.where(or_(title_match, content_match))
+            if collection is not None:
+                if collection == "":
+                    # Unfiled: sessions with no collection label at all.
+                    stmt = stmt.where(
+                        SqlConversation.id.not_in(
+                            select(SqlConversationLabel.conversation_id).where(
+                                SqlConversationLabel.key == "collection"
+                            )
+                        )
+                    )
+                else:
+                    # Specific collection: session must have this collection label.
+                    stmt = stmt.where(
+                        SqlConversation.id.in_(
+                            select(SqlConversationLabel.conversation_id).where(
+                                SqlConversationLabel.key == "collection",
+                                SqlConversationLabel.value == collection,
+                            )
+                        )
+                    )
             if after:
                 stmt = self._apply_cursor(
                     stmt,

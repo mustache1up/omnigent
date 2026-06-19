@@ -135,3 +135,117 @@ async def test_patch_session_not_found(client: httpx.AsyncClient) -> None:
         headers={"Content-Type": "application/json"},
     )
     assert resp.status_code == 404
+
+
+# ── GET /v1/sessions/collections ────────────────────────────────────────
+
+
+async def test_list_collections_empty(client: httpx.AsyncClient) -> None:
+    """No collection labels anywhere → empty collection list."""
+    resp = await client.get("/v1/sessions/collections")
+    assert resp.status_code == 200
+    assert resp.json() == []
+
+
+async def test_list_collections_returns_names_sorted(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """Collections surface as a sorted list of names."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    a = conv_store.create_conversation()
+    b = conv_store.create_conversation()
+    conv_store.set_labels(a.id, {"collection": "Sprint 42"})
+    conv_store.set_labels(b.id, {"collection": "Customer X"})
+
+    resp = await client.get("/v1/sessions/collections")
+    assert resp.status_code == 200
+    assert resp.json() == ["Customer X", "Sprint 42"]
+
+
+# ── GET /v1/sessions?collection= (filter) ───────────────────────────────
+
+
+async def test_list_sessions_filtered_by_collection(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """``?collection=X`` returns only sessions in that collection."""
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    # GET /v1/sessions filters has_agent_id=True, so bind the conversations to
+    # a seeded agent — otherwise the list comes back empty.
+    agent_id = generate_agent_id()
+    agent_store.create(agent_id, name="collection-agent", bundle_location="test:///bundle")
+    filed = conv_store.create_conversation(agent_id=agent_id)
+    conv_store.create_conversation(agent_id=agent_id)  # unfiled
+    conv_store.set_labels(filed.id, {"collection": "X"})
+
+    resp = await client.get("/v1/sessions?collection=X")
+    assert resp.status_code == 200
+    ids = [s["id"] for s in resp.json()["data"]]
+    assert ids == [filed.id]
+
+
+async def test_list_sessions_empty_collection_returns_unfiled(
+    client: httpx.AsyncClient,
+    db_uri: str,
+) -> None:
+    """``?collection=`` (empty) returns only sessions with no collection label."""
+    agent_store = SqlAlchemyAgentStore(db_uri)
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    agent_id = generate_agent_id()
+    agent_store.create(agent_id, name="collection-agent", bundle_location="test:///bundle")
+    filed = conv_store.create_conversation(agent_id=agent_id)
+    unfiled = conv_store.create_conversation(agent_id=agent_id)
+    conv_store.set_labels(filed.id, {"collection": "X"})
+
+    resp = await client.get("/v1/sessions?collection=")
+    assert resp.status_code == 200
+    ids = [s["id"] for s in resp.json()["data"]]
+    assert unfiled.id in ids
+    assert filed.id not in ids
+
+
+# ── PATCH /v1/sessions/{id} collection label ────────────────────────────
+
+
+async def test_patch_session_sets_collection_label(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """PATCH with ``labels: {collection: X}`` upserts the collection label."""
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {"collection": "Sprint 42"}},
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 200
+
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert conv.labels.get("collection") == "Sprint 42"
+
+
+async def test_patch_session_empty_collection_removes_label(
+    client: httpx.AsyncClient,
+    session_id: str,
+    db_uri: str,
+) -> None:
+    """PATCH with ``labels: {collection: ""}`` removes the collection label rather
+    than persisting an empty value — so the session returns to Unfiled."""
+    conv_store = SqlAlchemyConversationStore(db_uri)
+    conv_store.set_labels(session_id, {"collection": "Sprint 42"})
+
+    resp = await client.patch(
+        f"/v1/sessions/{session_id}",
+        json={"labels": {"collection": ""}},
+        headers={"Content-Type": "application/json"},
+    )
+    assert resp.status_code == 200
+
+    conv = conv_store.get_conversation(session_id)
+    assert conv is not None
+    assert "collection" not in conv.labels

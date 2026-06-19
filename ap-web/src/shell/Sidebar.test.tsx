@@ -11,6 +11,14 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { TooltipProvider } from "@/components/ui/tooltip";
 import type { Conversation } from "@/hooks/useConversations";
 
+// Collection mocks are declared via vi.hoisted so they exist before the hoisted
+// vi.mock factory runs. collectionsMock is mutated per-test to drive collection
+// sections; moveToCollectionSpy captures kebab-menu "Move to collection" calls.
+const { collectionsMock, moveToCollectionSpy } = vi.hoisted(() => ({
+  collectionsMock: [] as string[],
+  moveToCollectionSpy: vi.fn(),
+}));
+
 // Mutation hooks are only invoked on row actions; stub them. useConversations
 // is the data source under test, so it's a controllable mock.
 vi.mock("@/hooks/useConversations", () => ({
@@ -24,6 +32,11 @@ vi.mock("@/hooks/useConversations", () => ({
   usePinnedConversationBackfill: () => [],
   useRenameConversation: () => ({ mutate: vi.fn() }),
   useStopSession: () => ({ mutate: vi.fn() }),
+  // Collection feature: the sidebar reads the collection list to build collection
+  // sections, and rows fire useMoveToCollection from the kebab menu. Both must
+  // be stubbed or the Sidebar throws on render.
+  useCollections: () => ({ data: collectionsMock }),
+  useMoveToCollection: () => ({ mutate: moveToCollectionSpy }),
 }));
 // Header / dialog children that pull their own context — stub to keep the
 // test scoped to the conversation list + funnel.
@@ -99,6 +112,8 @@ function renderSidebar(open = true) {
 beforeEach(() => {
   useConvMock.mockReset();
   localStorage.clear();
+  collectionsMock.length = 0;
+  moveToCollectionSpy.mockReset();
 });
 afterEach(cleanup);
 
@@ -302,6 +317,236 @@ describe("Sidebar load-more vs collapsed Recent", () => {
     expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
     fireEvent.click(screen.getByRole("button", { name: "Recent" }));
     expect(screen.getByRole("button", { name: "Load more" })).toBeInTheDocument();
+  });
+});
+
+// Collection feature: sessions carrying a `collection` label are peeled out of
+// "Recent" into a dedicated section named after the collection, rendered between
+// Pinned and Recent. The collection list comes from useCollections() (mocked here).
+describe("Sidebar collection sections", () => {
+  it("groups sessions by their collection label, separate from Recent", () => {
+    collectionsMock.push("Customer X");
+    mockConversations([
+      conv("conv_unfiled", "Claude Code"),
+      conv("conv_filed", "Claude Code", { labels: { collection: "Customer X" } }),
+    ]);
+    renderSidebar();
+
+    // Collections default collapsed, so the row is hidden until the header is
+    // clicked. The unfiled session stays visible in Recent regardless.
+    const recentSection = screen.getByText("Recent").closest("section")!;
+    expect(within(recentSection).getByText("conv_unfiled")).toBeInTheDocument();
+    expect(within(recentSection).queryByText("conv_filed")).toBeNull();
+    expect(screen.queryByText("conv_filed")).toBeNull();
+
+    // Expanding the collection reveals its session under the collection section.
+    fireEvent.click(screen.getByRole("button", { name: /Customer X/ }));
+    const collectionSection = screen.getByText("Customer X").closest("section")!;
+    expect(within(collectionSection).getByText("conv_filed")).toBeInTheDocument();
+    expect(within(recentSection).queryByText("conv_filed")).toBeNull();
+  });
+
+  it("starts collections collapsed and shows their session count", () => {
+    collectionsMock.push("Customer X");
+    mockConversations([
+      conv("conv_filed", "Claude Code", { labels: { collection: "Customer X" } }),
+    ]);
+    renderSidebar();
+
+    // Header is present (with the rendered count) but the row is hidden, and
+    // the toggle reports collapsed via aria-expanded.
+    const header = screen.getByRole("button", { name: /Customer X/ });
+    expect(header).toHaveAttribute("aria-expanded", "false");
+    expect(within(header).getByText("1")).toBeInTheDocument();
+    expect(screen.queryByText("conv_filed")).toBeNull();
+  });
+
+  it("keeps a pinned session inside its collection, sorted first", () => {
+    collectionsMock.push("Customer X");
+    mockConversations([
+      conv("conv_plain", "Claude Code", { labels: { collection: "Customer X" } }),
+      conv("conv_pinned", "Claude Code", { labels: { collection: "Customer X" } }),
+    ]);
+    // Pin one of the collectioned sessions via localStorage (client-side pins).
+    localStorage.setItem(
+      "omnigent:pinned-conversation-ids",
+      JSON.stringify(["conv_pinned"]),
+    );
+    renderSidebar();
+
+    // No global "Pinned" section — the pinned session stays in its collection.
+    expect(screen.queryByText("Pinned")).toBeNull();
+    fireEvent.click(screen.getByRole("button", { name: /Customer X/ }));
+    const collectionSection = screen.getByText("Customer X").closest("section")!;
+    const rows = within(collectionSection).getAllByRole("link");
+    // Pinned row sorts to the top of the collection.
+    expect(rows[0]).toHaveTextContent("conv_pinned");
+    expect(rows[1]).toHaveTextContent("conv_plain");
+  });
+
+  it("does not render a collection section when useCollections returns nothing", () => {
+    // A session with a stale collection label but no matching collection entry stays
+    // in Recent — collections are driven by the collection list, not the labels alone.
+    mockConversations([conv("conv_filed", "Claude Code", { labels: { collection: "Ghost" } })]);
+    renderSidebar();
+
+    expect(screen.queryByText("Ghost")).toBeNull();
+    const recentSection = screen.getByText("Recent").closest("section")!;
+    expect(within(recentSection).getByText("conv_filed")).toBeInTheDocument();
+  });
+});
+
+// A collapsed collection bubbles up its hidden rows' marker, using the same
+// SessionStateBadge a row shows. Only while collapsed.
+describe("Sidebar collapsed collection marker", () => {
+  it("shows the row's session-state badge on a collapsed collection", () => {
+    collectionsMock.push("Customer X");
+    mockConversations([
+      conv("conv_awaiting", "Claude Code", {
+        labels: { collection: "Customer X" },
+        pending_elicitations_count: 1,
+      }),
+    ]);
+    renderSidebar();
+
+    // Collapsed by default → the row is hidden, but its "Needs response"
+    // marker surfaces on the collection header.
+    const header = screen.getByRole("button", { name: /Customer X/ });
+    expect(header).toHaveAttribute("aria-expanded", "false");
+    expect(within(header).getByText("Needs response")).toBeInTheDocument();
+  });
+
+  it("drops the header marker once the collection is expanded", () => {
+    collectionsMock.push("Customer X");
+    mockConversations([
+      conv("conv_awaiting", "Claude Code", {
+        labels: { collection: "Customer X" },
+        pending_elicitations_count: 1,
+      }),
+    ]);
+    renderSidebar();
+
+    fireEvent.click(screen.getByRole("button", { name: /Customer X/ }));
+    const header = screen.getByRole("button", { name: /Customer X/ });
+    expect(header).toHaveAttribute("aria-expanded", "true");
+    // The visible row now owns the badge; the header no longer carries it.
+    expect(within(header).queryByText("Needs response")).toBeNull();
+  });
+
+  it("shows no header marker when no collectioned row has one", () => {
+    collectionsMock.push("Customer X");
+    mockConversations([
+      conv("conv_plain", "Claude Code", { labels: { collection: "Customer X" } }),
+    ]);
+    renderSidebar();
+
+    const header = screen.getByRole("button", { name: /Customer X/ });
+    expect(within(header).queryByText("Needs response")).toBeNull();
+  });
+});
+
+// Pinned and Recent are expanded by default (only Archived starts collapsed),
+// but a collapse the user makes persists across reloads.
+describe("Sidebar default section collapse", () => {
+  it("expands Pinned and Recent by default when there is no stored preference", () => {
+    localStorage.setItem("omnigent:pinned-conversation-ids", JSON.stringify(["conv_pin"]));
+    mockConversations([conv("conv_pin", "Claude Code"), conv("conv_recent", "Claude Code")]);
+    renderSidebar();
+
+    expect(screen.getByRole("button", { name: /Pinned/ })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+    expect(screen.getByRole("button", { name: /Recent/ })).toHaveAttribute(
+      "aria-expanded",
+      "true",
+    );
+  });
+
+  it("honors a persisted collapse of Recent across remount", () => {
+    localStorage.setItem(
+      "omnigent:collapsed-sidebar-sections",
+      JSON.stringify(["Recent"]),
+    );
+    mockConversations([conv("conv_recent", "Claude Code")]);
+    renderSidebar();
+
+    expect(screen.getByRole("button", { name: /Recent/ })).toHaveAttribute(
+      "aria-expanded",
+      "false",
+    );
+    expect(screen.queryByText("conv_recent")).toBeNull();
+  });
+});
+
+// The quick-pin affordance is hover-revealed on unpinned rows, but a pinned
+// row must keep its pin marker visible at rest so the pinned state reads
+// without hovering.
+describe("Sidebar pin marker visibility", () => {
+  it("keeps the pin button visible at rest once a conversation is pinned", () => {
+    mockConversations([conv("conv_pin", "Claude Code")]);
+    localStorage.setItem(
+      "omnigent:pinned-conversation-ids",
+      JSON.stringify(["conv_pin"]),
+    );
+    renderSidebar();
+
+    const pinned = screen.getByText("Pinned").closest("section")!;
+    const pinButton = within(pinned).getByTestId("quick-pin-conversation");
+    // Pinned: always opaque (no hover-gated opacity-0).
+    expect(pinButton.className).toContain("opacity-100");
+    expect(pinButton.className).not.toContain("md:opacity-0");
+  });
+
+  it("omits the pin affordance entirely on an archived row", () => {
+    // Pinned in storage AND archived: archive wins, so the row sits in the
+    // Archived group with NO pin button at all (not even on hover) — pinning
+    // is meaningless there.
+    mockConversations([
+      conv("conv_pa", "Claude Code", { archived: true }),
+    ]);
+    localStorage.setItem(
+      "omnigent:pinned-conversation-ids",
+      JSON.stringify(["conv_pa"]),
+    );
+    renderSidebar();
+
+    fireEvent.click(screen.getByRole("button", { name: "Archived" }));
+    const archived = screen.getByText("Archived").closest("section")!;
+    expect(within(archived).queryByTestId("quick-pin-conversation")).toBeNull();
+  });
+
+  it("hides the pin affordance until hover on an unpinned row", () => {
+    mockConversations([conv("conv_plain", "Claude Code")]);
+    renderSidebar();
+
+    const pinButton = screen.getByTestId("quick-pin-conversation");
+    // Unpinned: hover-gated reveal (opacity-0 until group-hover).
+    expect(pinButton.className).toContain("md:opacity-0");
+  });
+});
+
+// The kebab menu's "Move to collection" item opens the collection picker; selecting a
+// collection fires useMoveToCollection with the row id and chosen collection name.
+describe("Sidebar move-to-collection action", () => {
+  it("moves a session into a collection selected from the picker", async () => {
+    collectionsMock.push("Sprint 42");
+    mockConversations([conv("conv_move", "Claude Code")]);
+    renderSidebar();
+
+    // Open the row's kebab menu (Radix opens on pointerdown, not click), then
+    // open the "Move to collection" submenu flyout.
+    const row = screen.getByRole("link", { name: /conv_move/ }).closest("li")!;
+    fireEvent.pointerDown(
+      within(row).getByRole("button", { name: "Conversation actions" }),
+      { button: 0, ctrlKey: false },
+    );
+    fireEvent.click(await screen.findByTestId("move-to-collection"));
+
+    // Collections render as menu items inside the submenu; picking one fires the
+    // mutation with id + collection.
+    fireEvent.click(await screen.findByRole("menuitem", { name: /Sprint 42/ }));
+    expect(moveToCollectionSpy).toHaveBeenCalledWith({ id: "conv_move", collection: "Sprint 42" });
   });
 });
 

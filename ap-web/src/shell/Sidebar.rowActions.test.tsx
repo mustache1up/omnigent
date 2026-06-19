@@ -35,6 +35,8 @@ vi.mock("@/hooks/useConversations", () => ({
   useBulkDeleteConversations: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useBulkStopSessions: () => ({ mutate: vi.fn(), isPending: false, isError: false }),
   useStopSession: () => ({ mutate: vi.fn() }),
+  useCollections: () => ({ data: [] }),
+  useMoveToCollection: () => ({ mutate: vi.fn() }),
 }));
 
 // Heavy sibling widgets pull their own hooks/providers; stub them so this

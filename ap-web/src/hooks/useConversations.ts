@@ -18,7 +18,13 @@
 // `ActiveChatOverride`) so sends don't reorder it.
 
 import { useMemo } from "react";
-import { useInfiniteQuery, useMutation, useQueries, useQueryClient } from "@tanstack/react-query";
+import {
+  useInfiniteQuery,
+  useMutation,
+  useQueries,
+  useQuery,
+  useQueryClient,
+} from "@tanstack/react-query";
 import { authenticatedFetch } from "@/lib/identity";
 import {
   filtersFromConversationQueryKey,
@@ -596,4 +602,51 @@ export function usePinnedConversationBackfill(
     return backfilled;
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [resolvedIds]);
+}
+
+// ── Collection hooks ─────────────────────────────────────────────────────────────
+
+/** Fetch all collection names from `GET /v1/sessions/collections`. */
+export function useCollections() {
+  return useQuery<string[]>({
+    queryKey: ["collections"],
+    queryFn: async () => {
+      const res = await authenticatedFetch("/v1/sessions/collections");
+      if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+      return (await res.json()) as string[];
+    },
+    staleTime: 30_000,
+  });
+}
+
+async function moveConversationToCollection(id: string, collection: string): Promise<Conversation> {
+  const res = await authenticatedFetch(`/v1/sessions/${encodeURIComponent(id)}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    // Empty string signals "remove from collection" (server deletes the label row).
+    body: JSON.stringify({ labels: { collection } }),
+  });
+  if (!res.ok) throw new Error(`${res.status} ${res.statusText}`);
+  return (await res.json()) as Conversation;
+}
+
+/**
+ * Move a session to a collection (or remove it from all collections when `collection=""`).
+ *
+ * Invalidates both the conversations list (so sidebar sections re-group) and
+ * the collections list (so counts update). Patch-in-place is skipped here — collection
+ * changes affect which sidebar section a session belongs to, so a full
+ * re-render of the list is correct.
+ */
+export function useMoveToCollection() {
+  const queryClient = useQueryClient();
+  return useMutation({
+    mutationFn: ({ id, collection }: { id: string; collection: string }) =>
+      moveConversationToCollection(id, collection),
+    onSuccess: (updated) => {
+      markConversationSeen(updated.id, updated.updated_at);
+      void queryClient.invalidateQueries({ queryKey: ["conversations"] });
+      void queryClient.invalidateQueries({ queryKey: ["collections"] });
+    },
+  });
 }

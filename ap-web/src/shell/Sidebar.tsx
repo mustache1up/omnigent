@@ -2,6 +2,7 @@ import {
   type CSSProperties,
   type KeyboardEvent,
   type MouseEvent,
+  type ReactNode,
   useCallback,
   useEffect,
   useMemo,
@@ -13,8 +14,12 @@ import {
   ArchiveIcon,
   ArchiveRestoreIcon,
   CheckIcon,
+  CheckIcon as CheckMarkIcon,
   ChevronRightIcon,
   CircleStopIcon,
+  ClockIcon,
+  FolderIcon,
+  FolderInputIcon,
   GitBranchIcon,
   InboxIcon,
   ListChecksIcon,
@@ -29,6 +34,7 @@ import {
   SquareIcon,
   SquareCheckIcon,
   Trash2Icon,
+  UsersIcon,
   XIcon,
 } from "lucide-react";
 import { Link, useLocation, useNavigate, useParams } from "@/lib/routing";
@@ -45,6 +51,9 @@ import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
+  DropdownMenuSub,
+  DropdownMenuSubContent,
+  DropdownMenuSubTrigger,
   DropdownMenuTrigger,
 } from "@/components/ui/dropdown-menu";
 import {
@@ -52,7 +61,9 @@ import {
   useArchiveConversation,
   useBulkArchiveConversations,
   useBulkDeleteConversations,
+  useCollections,
   useConversations,
+  useMoveToCollection,
   usePinnedConversationBackfill,
   useRenameConversation,
   useStopAndDeleteConversation,
@@ -65,7 +76,7 @@ import { useCommentInbox } from "@/hooks/useCommentInbox";
 import { useSessionRunnerOnline } from "@/hooks/RunnerHealthProvider";
 import { isSessionStoppable } from "@/lib/sessionStop";
 import { isOwnerLevel } from "@/lib/permissionsApi";
-import { getSessionState } from "@/hooks/useSessionState";
+import { getSessionState, type SessionState } from "@/hooks/useSessionState";
 import { isConversationUnseen } from "@/hooks/useUnseenConversations";
 import { sumPendingApprovals } from "@/lib/inbox";
 import { cn } from "@/lib/utils";
@@ -79,6 +90,7 @@ import {
   COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY,
   computeNextActiveOverride,
   conversationDisplayLabel,
+  EXPANDED_COLLECTION_SECTIONS_STORAGE_KEY,
   normalizePinnedConversationIds,
   PINNED_CONVERSATION_IDS_STORAGE_KEY,
   sortByUpdatedAtDesc,
@@ -456,6 +468,9 @@ function ConversationList({
     [conversationsQuery.data],
   );
 
+  // Collection names for grouping sessions by their "collection" label.
+  const { data: collectionNames = [] } = useCollections();
+
   // Backfill pinned sessions that aren't in the loaded set.
   const loadedIds = useMemo(() => new Set(allConversations.map((c) => c.id)), [allConversations]);
   const pinnedBackfill = usePinnedConversationBackfill(pinnedConversationIds, loadedIds);
@@ -477,23 +492,56 @@ function ConversationList({
   const pinnedSet = useMemo(() => new Set(pinnedConversationIds), [pinnedConversationIds]);
   const sections = useMemo(() => {
     const allWithBackfill = [...allConversations, ...pinnedBackfill];
+    const notArchived = allWithBackfill.filter((c) => c.archived !== true);
+
+    // Collections are built first. A collectioned session STAYS in its collection even
+    // when pinned (B2): pinning sorts the row to the top of its collection rather
+    // than pulling it out into the global Pinned section. Archived rows are
+    // excluded — they belong to the Archived group regardless of collection label.
+    const collectedIds = new Set<string>();
+    const collectionGroups: { name: string; conversations: Conversation[] }[] = collectionNames
+      .map((name) => {
+        const inCollection = notArchived.filter((c) => c.labels?.["collection"] === name);
+        inCollection.forEach((c) => collectedIds.add(c.id));
+        // Pinned-first, then by recency — both buckets share the same sort.
+        const conversations = [
+          ...sortByUpdatedAtDesc(
+            inCollection.filter((c) => pinnedSet.has(c.id)),
+            activeOverride,
+          ),
+          ...sortByUpdatedAtDesc(
+            inCollection.filter((c) => !pinnedSet.has(c.id)),
+            activeOverride,
+          ),
+        ];
+        return { name, conversations };
+      })
+      .filter((g) => g.conversations.length > 0);
+
+    // The global Pinned section now holds only pinned sessions that are NOT
+    // in a collection — collectioned pins live under their collection instead.
     const pinned = sortByUpdatedAtDesc(
-      allWithBackfill.filter((c) => pinnedSet.has(c.id) && c.archived !== true),
+      notArchived.filter((c) => pinnedSet.has(c.id) && !collectedIds.has(c.id)),
       activeOverride,
     );
     const pinnedIdSet = new Set(pinned.map((c) => c.id));
-    const active = allConversations.filter((c) => !pinnedIdSet.has(c.id) && c.archived !== true);
-    const sessions = sortByUpdatedAtDesc(active.filter(isOwnedByViewer), activeOverride);
+
+    // Recent / Shared: the remainder — not archived, not globally pinned, and
+    // not in any collection.
+    const rest = allConversations.filter(
+      (c) => c.archived !== true && !pinnedIdSet.has(c.id) && !collectedIds.has(c.id),
+    );
+    const sessions = sortByUpdatedAtDesc(rest.filter(isOwnedByViewer), activeOverride);
     const shared = sortByUpdatedAtDesc(
-      active.filter((c) => !isOwnedByViewer(c)),
+      rest.filter((c) => !isOwnedByViewer(c)),
       activeOverride,
     );
     const archived = sortByUpdatedAtDesc(
       allWithBackfill.filter((c) => c.archived === true),
       activeOverride,
     );
-    return { pinned, sessions, shared, archived };
-  }, [allConversations, pinnedBackfill, pinnedSet, activeOverride]);
+    return { pinned, sessions, shared, archived, collectionGroups };
+  }, [allConversations, pinnedBackfill, pinnedSet, activeOverride, collectionNames]);
 
   // Collapsed section titles — persisted like pins so the preference
   // survives reloads. Lifted here (not per-section state) because the
@@ -511,18 +559,39 @@ function ConversationList({
     });
   }, []);
 
+  // Collections default to COLLAPSED, so we track the inverse — names the user has
+  // expanded — persisted across reloads. A collection shows its rows only while
+  // its name is in this set.
+  const [expandedCollections, setExpandedCollections] = useState<string[]>(
+    readExpandedCollectionSections,
+  );
+  const toggleCollectionExpanded = useCallback((collectionName: string) => {
+    setExpandedCollections((prev) => {
+      const next = prev.includes(collectionName)
+        ? prev.filter((n) => n !== collectionName)
+        : [...prev, collectionName];
+      writeExpandedCollectionSections(next);
+      return next;
+    });
+  }, []);
+
   // Visible rows in render order (collapsed sections excluded) for the Cmd+↑/↓
   // session hotkey. Titles must match the <ConversationSection> props below.
   const orderedConversationIds = useMemo(() => {
     const visible = (title: string, list: readonly Conversation[]) =>
       collapsedSections.includes(title) ? [] : list;
+    // Collections are collapsed unless explicitly expanded (inverse of the fixed
+    // sections above).
+    const collectionVisible = (name: string, list: readonly Conversation[]) =>
+      expandedCollections.includes(name) ? list : [];
     return [
+      ...sections.collectionGroups.flatMap((g) => collectionVisible(g.name, g.conversations)),
       ...visible("Pinned", sections.pinned),
       ...visible("Recent", sections.sessions),
       ...visible("Shared with me", sections.shared),
       ...visible("Archived", sections.archived),
     ].map((c) => c.id);
-  }, [sections, collapsedSections]);
+  }, [sections, collapsedSections, expandedCollections]);
   useSessionSwitchHotkey(orderedConversationIds, activeId);
 
   // Only normalize pinned ids once all pages are loaded; a pin that
@@ -563,7 +632,8 @@ function ConversationList({
     sections.pinned.length +
     sections.sessions.length +
     sections.shared.length +
-    sections.archived.length;
+    sections.archived.length +
+    sections.collectionGroups.reduce((sum, g) => sum + g.conversations.length, 0);
 
   // Section structure comes from the muted micro-headers + whitespace
   // alone (Linear-style) — no divider rules between groups.
@@ -573,13 +643,34 @@ function ConversationList({
         <p className="px-2 py-1 text-muted-foreground text-xs">{emptyMessage}</p>
       ) : (
         <>
+          {sections.collectionGroups.map((group) => (
+            <ConversationSection
+              key={group.name}
+              title={group.name}
+              icon={<FolderIcon className="size-3 mr-1 inline-block" />}
+              count={group.conversations.length}
+              marker={collectionMarkerState(group.conversations)}
+              conversations={group.conversations}
+              pinnedConversationIds={pinnedConversationIds}
+              // Collections default collapsed: shown only when explicitly expanded.
+              collapsed={!expandedCollections.includes(group.name)}
+              onToggleCollapsed={() => toggleCollectionExpanded(group.name)}
+              onRowClick={onRowClick}
+              onTogglePinned={onTogglePinned}
+              selectionMode={selectionMode}
+              selectedIds={selectedIds}
+              onToggleSelected={onToggleSelected}
+            />
+          ))}
           {sections.pinned.length > 0 && (
             <ConversationSection
               title="Pinned"
+              icon={<PinIcon className="size-3 mr-1 inline-block" />}
+              count={sections.pinned.length}
               conversations={sections.pinned}
               pinnedConversationIds={pinnedConversationIds}
-              collapsedSections={collapsedSections}
-              onToggleCollapsed={toggleSectionCollapsed}
+              collapsed={collapsedSections.includes("Pinned")}
+              onToggleCollapsed={() => toggleSectionCollapsed("Pinned")}
               onRowClick={onRowClick}
               onTogglePinned={onTogglePinned}
               selectionMode={selectionMode}
@@ -590,10 +681,12 @@ function ConversationList({
           {sections.sessions.length > 0 && (
             <ConversationSection
               title="Recent"
+              icon={<ClockIcon className="size-3 mr-1 inline-block" />}
+              count={sections.sessions.length}
               conversations={sections.sessions}
               pinnedConversationIds={pinnedConversationIds}
-              collapsedSections={collapsedSections}
-              onToggleCollapsed={toggleSectionCollapsed}
+              collapsed={collapsedSections.includes("Recent")}
+              onToggleCollapsed={() => toggleSectionCollapsed("Recent")}
               onRowClick={onRowClick}
               onTogglePinned={onTogglePinned}
               selectionMode={selectionMode}
@@ -604,10 +697,12 @@ function ConversationList({
           {sections.shared.length > 0 && (
             <ConversationSection
               title="Shared with me"
+              icon={<UsersIcon className="size-3 mr-1 inline-block" />}
+              count={sections.shared.length}
               conversations={sections.shared}
               pinnedConversationIds={pinnedConversationIds}
-              collapsedSections={collapsedSections}
-              onToggleCollapsed={toggleSectionCollapsed}
+              collapsed={collapsedSections.includes("Shared with me")}
+              onToggleCollapsed={() => toggleSectionCollapsed("Shared with me")}
               onRowClick={onRowClick}
               onTogglePinned={onTogglePinned}
               selectionMode={selectionMode}
@@ -618,10 +713,12 @@ function ConversationList({
           {sections.archived.length > 0 && (
             <ConversationSection
               title="Archived"
+              icon={<ArchiveIcon className="size-3 mr-1 inline-block" />}
+              count={sections.archived.length}
               conversations={sections.archived}
               pinnedConversationIds={pinnedConversationIds}
-              collapsedSections={collapsedSections}
-              onToggleCollapsed={toggleSectionCollapsed}
+              collapsed={collapsedSections.includes("Archived")}
+              onToggleCollapsed={() => toggleSectionCollapsed("Archived")}
               onRowClick={onRowClick}
               onTogglePinned={onTogglePinned}
               selectionMode={selectionMode}
@@ -656,11 +753,40 @@ function ConversationList({
   );
 }
 
+/**
+ * Aggregate the sidebar marker for a collection from its conversations, using
+ * the same precedence a row uses (awaiting > unseen > running). Returned as a
+ * {@link SessionState} so a collapsed collection header can render the exact
+ * same {@link SessionStateBadge} the rows do. ``null`` = no marker.
+ */
+function collectionMarkerState(conversations: Conversation[]): SessionState | null {
+  let awaiting = 0;
+  let unseen = false;
+  let running = false;
+  for (const c of conversations) {
+    const pending = c.pending_elicitations_count ?? 0;
+    if (pending > 0) {
+      awaiting += pending;
+    } else if (isConversationUnseen(c.id, c.updated_at, c.status)) {
+      unseen = true;
+    } else if (c.status === "running") {
+      running = true;
+    }
+  }
+  if (awaiting > 0) return { kind: "awaiting", count: awaiting };
+  if (unseen) return { kind: "unseen" };
+  if (running) return { kind: "running" };
+  return null;
+}
+
 function ConversationSection({
   title,
+  icon,
+  count,
+  marker,
   conversations,
   pinnedConversationIds,
-  collapsedSections,
+  collapsed,
   onToggleCollapsed,
   onRowClick,
   onTogglePinned,
@@ -669,38 +795,69 @@ function ConversationSection({
   onToggleSelected,
 }: {
   title?: string;
+  /** Optional icon rendered before the title (e.g. collection icon). */
+  icon?: ReactNode;
+  /** Optional count badge after the title (e.g. collection session count). */
+  count?: number;
+  /** When collapsed, the aggregate marker of hidden rows (same badge as a row). */
+  marker?: SessionState | null;
   conversations: Conversation[];
   pinnedConversationIds: string[];
-  collapsedSections: string[];
-  onToggleCollapsed: (sectionTitle: string) => void;
+  /** Whether this section is currently collapsed. */
+  collapsed: boolean;
+  onToggleCollapsed: () => void;
   onRowClick: (e: MouseEvent<HTMLAnchorElement>) => void;
   onTogglePinned: (conversationId: string) => void;
   selectionMode: boolean;
   selectedIds: Set<string>;
   onToggleSelected: (conversationId: string) => void;
 }) {
-  const collapsed = title != null && collapsedSections.includes(title);
+  // An untitled section is always open — there's no header to collapse it.
+  const isCollapsed = title != null && collapsed;
   return (
     <section>
       {title && (
         <h2>
           <button
             type="button"
-            aria-expanded={!collapsed}
-            onClick={() => onToggleCollapsed(title)}
+            aria-expanded={!isCollapsed}
+            onClick={onToggleCollapsed}
             className="group flex w-full items-center gap-1 rounded-md px-2 py-1 text-left text-xs font-medium text-muted-foreground transition-colors hover:text-foreground"
           >
-            {title}
-            <ChevronRightIcon
-              className={cn(
-                "size-3.5 shrink-0 transition-transform",
-                !collapsed && "rotate-90 opacity-0 group-hover:opacity-100",
+            {icon}
+            <span className="truncate">{title}</span>
+            {/* Count + chevron are pinned to the right edge so every section
+                header aligns, whether or not it has a count. */}
+            <span className="ml-auto flex shrink-0 items-center gap-1">
+              {isCollapsed && marker && (
+                // A hidden row inside this collapsed section carries a marker —
+                // surface the exact same badge a row would show. Extra right
+                // margin keeps the dot off the count.
+                <span className="mr-1 flex items-center">
+                  <SessionStateBadge state={marker} />
+                </span>
               )}
-            />
+              {count != null && (
+                // Decorative: aria-hidden keeps the header's accessible name
+                // the bare title (e.g. "Archived"), not "Archived 3".
+                <span aria-hidden className="tabular-nums opacity-60">
+                  {count}
+                </span>
+              )}
+              {/* Chevron trails the count (Codex/Cursor-style). Hidden until
+                  hover when expanded; always visible when collapsed so the
+                  hidden content stays discoverable. */}
+              <ChevronRightIcon
+                className={cn(
+                  "size-3.5 shrink-0 transition-transform",
+                  !isCollapsed && "rotate-90 opacity-0 group-hover:opacity-100",
+                )}
+              />
+            </span>
           </button>
         </h2>
       )}
-      {!collapsed && (
+      {!isCollapsed && (
         <ul className="flex flex-col gap-0.5">
           {conversations.map((conv) => (
             <ConversationRow
@@ -753,6 +910,7 @@ function ConversationRow({
   const rename = useRenameConversation();
   const del = useStopAndDeleteConversation();
   const archive = useArchiveConversation();
+  const moveToCollection = useMoveToCollection();
   // Archive stops the runner first (resource hygiene): a hidden session
   // shouldn't keep a runner alive. This is NOT the user-facing Stop action
   // (the kebab's "Stop session" item below, backed by its own mutation) —
@@ -766,6 +924,9 @@ function ConversationRow({
   const [isEditing, setIsEditing] = useState(false);
   const [deleteOpen, setDeleteOpen] = useState(false);
   const [stopOpen, setStopOpen] = useState(false);
+  // The kebab menu is controlled so the collection submenu can close the whole
+  // menu after a pick (a plain click inside the submenu wouldn't otherwise).
+  const [menuOpen, setMenuOpen] = useState(false);
   // Opt-in "delete local branch" checkbox (worktree sessions only).
   const [deleteBranch, setDeleteBranch] = useState(false);
   const [shareOpen, setShareOpen] = useState(false);
@@ -976,7 +1137,10 @@ function ConversationRow({
           {relativeTime(conversation.updated_at * 1000)}
         </span>
       )}
-      {!selectionMode && (
+      {/* Archived rows omit the pin entirely: pinning is meaningless there
+          (archive outranks pin), so there's no pin action even on hover. Also
+          hidden while selecting (bulk mode owns the row controls). */}
+      {!selectionMode && !isArchived && (
         <Button
           type="button"
           variant="ghost"
@@ -984,9 +1148,18 @@ function ConversationRow({
           aria-label={isPinned ? "Unpin conversation" : "Pin conversation"}
           data-testid="quick-pin-conversation"
           className={cn(
-            "-translate-y-1/2 absolute top-1/2 right-9 transition-opacity",
-            "md:opacity-0 md:group-hover:opacity-100",
-            "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
+            // `group/pin` scopes the icon swap below to hovering THIS button,
+            // not the whole row.
+            "group/pin -translate-y-1/2 absolute top-1/2 right-9 transition-opacity",
+            // A pinned row keeps its pin marker visible at rest (it's the badge
+            // that signals the pinned state); an unpinned row reveals the pin
+            // affordance only on hover/focus or while the kebab menu is open.
+            isPinned
+              ? "opacity-100"
+              : cn(
+                  "md:opacity-0 md:group-hover:opacity-100",
+                  "md:group-has-[:focus-visible]:opacity-100 md:group-has-[[aria-expanded=true]]:opacity-100",
+                ),
           )}
           onClick={(e) => {
             // Keep the toggle click off the surrounding Link (no navigation).
@@ -995,11 +1168,20 @@ function ConversationRow({
             onTogglePinned(conversation.id);
           }}
         >
-          {isPinned ? <PinOffIcon className="size-3.5" /> : <PinIcon className="size-3.5" />}
+          {isPinned ? (
+            <>
+              {/* Pinned: solid pin at rest as the state marker; swap to the
+                  unpin glyph only while hovering this button. */}
+              <PinIcon className="size-3.5 group-hover/pin:hidden" />
+              <PinOffIcon className="hidden size-3.5 group-hover/pin:inline" />
+            </>
+          ) : (
+            <PinIcon className="size-3.5" />
+          )}
         </Button>
       )}
       {!selectionMode && (
-        <DropdownMenu>
+        <DropdownMenu open={menuOpen} onOpenChange={setMenuOpen}>
           <DropdownMenuTrigger asChild>
             <Button
               type="button"
@@ -1100,6 +1282,25 @@ function ConversationRow({
                   You need edit permissions to rename this session
                 </TooltipContent>
               </Tooltip>
+            )}
+            {canEdit && (
+              <DropdownMenuSub>
+                <DropdownMenuSubTrigger data-testid="move-to-collection">
+                  <FolderInputIcon className="size-3.5" />
+                  Move to collection
+                </DropdownMenuSubTrigger>
+                <DropdownMenuSubContent className="w-56 p-1">
+                  {/* A native submenu flyout — no separate popover layer, so no
+                      open/dismiss race with the parent menu. */}
+                  <CollectionPickerMenu
+                    currentCollection={conversation.labels?.["collection"] ?? null}
+                    onSelect={(collection) => {
+                      moveToCollection.mutate({ id: conversation.id, collection });
+                      setMenuOpen(false);
+                    }}
+                  />
+                </DropdownMenuSubContent>
+              </DropdownMenuSub>
             )}
             {/* Stop session — only on stoppable sessions whose runner isn't
               already known-offline (canStop). Owner-gated like Delete:
@@ -1363,6 +1564,123 @@ function ArchivingRow({ label }: { label: string }) {
     </div>
   );
 }
+
+// ── CollectionPickerMenu ─────────────────────────────────────────────────────────
+
+/**
+ * Collection picker rendered as the body of a {@link DropdownMenuSubContent}.
+ *
+ * Lives inside the kebab menu's submenu flyout rather than a separate popover —
+ * that avoids the open/dismiss race that made a standalone popover flash open
+ * and vanish. The search / new-collection inputs stop key events from bubbling so
+ * the menu's built-in typeahead and arrow-key navigation don't hijack typing.
+ */
+function CollectionPickerMenu({
+  currentCollection,
+  onSelect,
+}: {
+  currentCollection: string | null;
+  onSelect: (collection: string) => void;
+}) {
+  const { data: collections = [] } = useCollections();
+  const [search, setSearch] = useState("");
+  const [creatingNew, setCreatingNew] = useState(false);
+  const [newCollectionName, setNewCollectionName] = useState("");
+  const newInputRef = useRef<HTMLInputElement>(null);
+
+  useEffect(() => {
+    if (creatingNew) {
+      newInputRef.current?.focus();
+    }
+  }, [creatingNew]);
+
+  const filtered = search
+    ? collections.filter((name) => name.toLowerCase().includes(search.toLowerCase()))
+    : collections;
+
+  function handleNewCollectionCommit() {
+    const name = newCollectionName.trim();
+    setCreatingNew(false);
+    setNewCollectionName("");
+    if (name) onSelect(name);
+  }
+
+  // Keep keystrokes inside the inputs from reaching the menu's typeahead /
+  // navigation handlers (which would otherwise steal letters and arrows).
+  const swallowKeys = (e: KeyboardEvent<HTMLInputElement>) => e.stopPropagation();
+
+  return (
+    <>
+      <div className="px-2 py-1.5">
+        <input
+          className="w-full rounded border border-input bg-transparent px-2 py-1 text-xs outline-none placeholder:text-muted-foreground"
+          placeholder="Search collections…"
+          value={search}
+          onChange={(e) => setSearch(e.target.value)}
+          onKeyDown={swallowKeys}
+        />
+      </div>
+      <div className="max-h-48 overflow-y-auto">
+        {filtered.map((name) => (
+          <DropdownMenuItem key={name} onSelect={() => onSelect(name)}>
+            <FolderIcon className="size-3.5 shrink-0" />
+            <span className="flex-1 truncate text-left">{name}</span>
+            {currentCollection === name && (
+              <CheckMarkIcon className="size-3.5 shrink-0 text-primary" />
+            )}
+          </DropdownMenuItem>
+        ))}
+        {filtered.length === 0 && !creatingNew && (
+          <p className="px-2 py-1.5 text-xs text-muted-foreground">No collections yet.</p>
+        )}
+      </div>
+      <div className="border-t pt-1">
+        {creatingNew ? (
+          <div className="flex items-center gap-1 px-2 py-1">
+            <FolderIcon className="size-3.5 shrink-0 text-muted-foreground" />
+            <input
+              ref={newInputRef}
+              className="flex-1 bg-transparent text-xs outline-none"
+              placeholder="Collection name…"
+              value={newCollectionName}
+              onChange={(e) => setNewCollectionName(e.target.value)}
+              onKeyDown={(e) => {
+                e.stopPropagation();
+                if (e.key === "Enter") {
+                  e.preventDefault();
+                  handleNewCollectionCommit();
+                }
+                if (e.key === "Escape") {
+                  setCreatingNew(false);
+                  setNewCollectionName("");
+                }
+              }}
+            />
+          </div>
+        ) : (
+          <DropdownMenuItem
+            // Keep the menu open so the inline input can take over in place.
+            onSelect={(e) => {
+              e.preventDefault();
+              setCreatingNew(true);
+            }}
+          >
+            <FolderIcon className="size-3.5 shrink-0" />
+            New collection…
+          </DropdownMenuItem>
+        )}
+        {currentCollection && (
+          <DropdownMenuItem variant="destructive" onSelect={() => onSelect("")}>
+            <XIcon className="size-3.5 shrink-0" />
+            Remove from collection
+          </DropdownMenuItem>
+        )}
+      </div>
+    </>
+  );
+}
+
+// ── ConversationEditRow ──────────────────────────────────────────────────────
 
 interface ConversationEditRowProps {
   initialTitle: string;
@@ -1779,8 +2097,9 @@ function writePinnedConversationIds(ids: string[]) {
   }
 }
 
-// Archived starts collapsed until the user touches any section header —
-// once they do, the stored array (even an empty one) is the preference.
+// Default collapse state: only Archived starts collapsed. Pinned and Recent
+// are expanded by default — but once the user toggles any header, the stored
+// array (even an empty one) becomes the preference and persists across reloads.
 const DEFAULT_COLLAPSED_SIDEBAR_SECTIONS = ["Archived"];
 
 function readCollapsedSidebarSections(): string[] {
@@ -1804,6 +2123,30 @@ function writeCollapsedSidebarSections(titles: string[]) {
     window.localStorage.setItem(COLLAPSED_SIDEBAR_SECTIONS_STORAGE_KEY, JSON.stringify(titles));
   } catch {
     // Collapse state is a local navigation preference; losing it is fine.
+  }
+}
+
+// Collections default to collapsed, so the persisted set is the EXPANDED names
+// (empty by default = every collection starts collapsed).
+function readExpandedCollectionSections(): string[] {
+  if (typeof window === "undefined") return [];
+  try {
+    const raw = window.localStorage.getItem(EXPANDED_COLLECTION_SECTIONS_STORAGE_KEY);
+    if (!raw) return [];
+    const parsed: unknown = JSON.parse(raw);
+    if (!Array.isArray(parsed)) return [];
+    return parsed.filter((value): value is string => typeof value === "string");
+  } catch {
+    return [];
+  }
+}
+
+function writeExpandedCollectionSections(names: string[]) {
+  if (typeof window === "undefined") return;
+  try {
+    window.localStorage.setItem(EXPANDED_COLLECTION_SECTIONS_STORAGE_KEY, JSON.stringify(names));
+  } catch {
+    // Same as collapse state — a lost local preference is harmless.
   }
 }
 

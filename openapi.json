@@ -4800,6 +4800,22 @@
               "title": "Kind",
               "type": "string"
             }
+          },
+          {
+            "in": "query",
+            "name": "collection",
+            "required": false,
+            "schema": {
+              "anyOf": [
+                {
+                  "type": "string"
+                },
+                {
+                  "type": "null"
+                }
+              ],
+              "title": "Collection"
+            }
           }
         ],
         "responses": {
@@ -4841,6 +4857,26 @@
           }
         },
         "summary": "Create Session",
+        "tags": [
+          "sessions"
+        ]
+      }
+    },
+    "/v1/sessions/collections": {
+      "get": {
+        "description": "Return all collection names for the authenticated user, ordered\nalphabetically.\n\nCollections are implicit: they exist while at least one session\nhas a ``conversation_labels`` row with ``key=\"collection\"``.\n\n:returns: List of collection names.",
+        "operationId": "list_session_collections_v1_sessions_collections_get",
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {}
+              }
+            },
+            "description": "Successful Response"
+          }
+        },
+        "summary": "List Session Collections",
         "tags": [
           "sessions"
         ]
